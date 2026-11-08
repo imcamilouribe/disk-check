@@ -1,0 +1,179 @@
+# Compila un IPA de iOS sin firmar con el fork cheemu21/kid-with-sword-remake (nxnative) en un Mac de GitHub.
+# Pensado para juegos de Switch 1 pequeños con perfil en dm/games (p. ej. Link's Awakening, Skyward Sword HD).
+#
+# Úsalo SOLO en un repositorio PRIVADO: el IPA contiene el juego.
+#
+# Secretos (Settings → Secrets and variables → Actions), enlaces de Google Drive con
+# "Cualquier persona con el enlace - Lector" (o cualquier URL de descarga directa):
+#   Game_URL    juego base (.nsp / .xci / .nsz / .xcz, o un .zip/.rar/.7z que los contenga)   obligatorio
+#   Keys_URL    prod.keys                                                                     obligatorio
+#   Update_URL  actualización (misma versión que registra el perfil del juego)                opcional
+#   DLC_URL     DLC                                                                           opcional
+#
+# Diferencias con el YAML "universal" de Reddit:
+#   - usa tu fork y el runner xcode-27 con Xcode 27.2 (el compilador Metal que exige el repo);
+#     no reescribe dmsh_chain.lock, que es una protección contra shaders corruptos (issue #242)
+#   - conserva el nombre original de cada archivo (NSZ/XCZ siguen siendo NSZ/XCZ) y no duplica el juego en disco
+#   - deja que el propio script identifique el juego por su title ID
+#   - el artifact dura 1 día y se sube sin recomprimir, para no pasarte de la cuota de almacenamiento
+name: build-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      language:
+        description: "Idioma del juego (vacío = inglés). Ej.: es, es-419"
+        required: false
+        default: ""
+      fork_ref:
+        description: "Rama, tag o commit del fork"
+        required: false
+        default: "main"
+      skip_mac_boot:
+        description: "Saltar la comprobación que arranca el juego en el Mac (--no-heap-check). Actívalo si falla en 'address region check' (p. ej. Super Mario RPG)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer   # el mismo Xcode que usa el CI del fork
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+jobs:
+  ipa:
+    runs-on: xcode-27
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Código del fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cheemu21/kid-with-sword-remake
+          ref: ${{ inputs.fork_ref }}
+          path: src
+          persist-credentials: false
+
+      - name: Liberar disco
+        run: |
+          for x in /Applications/Xcode*.app; do
+            case "$x" in */Xcode_27.2.app) ;; *) [ -L "$x" ] || sudo rm -rf "$x" ;; esac
+          done
+          xcrun simctl delete all 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* ~/Library/Developer/CoreSimulator \
+                      ~/Library/Android "${ANDROID_HOME:-/nonexistent}" ~/.ghcup 2>/dev/null || true
+          df -h /
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "10.0.x"   # el traductor de shaders (dm/gfx/tools/dmsh_xlate_bin) usa net10.0
+
+      - name: Herramientas
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd glslang unar
+          python -m pip install --upgrade pip
+          python -m pip install -r src/.github/requirements/tools.txt gdown
+
+      - name: Xcode, compilador Metal y SDK de iOS
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1 || xcodebuild -downloadPlatform iOS
+          xcrun metal --version
+          (cd src && python dm/gfx/tools/own_compilers.py --check-metal)
+
+      - name: Descargar juego y claves
+        env:
+          GAME_URL: ${{ secrets.Game_URL }}
+          KEYS_URL: ${{ secrets.Keys_URL }}
+          UPDATE_URL: ${{ secrets.Update_URL }}
+          DLC_URL: ${{ secrets.DLC_URL }}
+        run: |
+          set -euo pipefail
+          GAME="$RUNNER_TEMP/game"; KEYS="$RUNNER_TEMP/keys"
+          mkdir -p "$GAME" "$KEYS"
+          [ -n "${GAME_URL:-}" ] || { echo "::error::Falta el secreto Game_URL"; exit 1; }
+          [ -n "${KEYS_URL:-}" ] || { echo "::error::Falta el secreto Keys_URL"; exit 1; }
+
+          fetch() {   # $1 nombre para el log, $2 URL, $3 carpeta destino (conserva el nombre original) o archivo
+            echo "Descargando $1..."
+            if ! gdown --fuzzy --quiet "$2" -O "$3"; then
+              echo "::error::No se pudo descargar $1. Revisa que el enlace sea 'Cualquier persona con el enlace' y apunte al archivo correcto."
+              exit 1
+            fi
+          }
+
+          fetch "prod.keys" "$KEYS_URL" "$KEYS/prod.keys"
+          grep -q '^header_key' "$KEYS/prod.keys" || { echo "::error::Keys_URL no parece un prod.keys (no tiene header_key)"; exit 1; }
+          chmod 600 "$KEYS/prod.keys"
+
+          fetch "juego base" "$GAME_URL" "$GAME/"
+          [ -n "${UPDATE_URL:-}" ] && fetch "actualización" "$UPDATE_URL" "$GAME/" || echo "Sin Update_URL: se compila sin actualización."
+          [ -n "${DLC_URL:-}" ] && fetch "DLC" "$DLC_URL" "$GAME/" || echo "Sin DLC_URL: se compila sin DLC."
+
+          # Archivos comprimidos: extraer y borrar el original para no ocupar el doble.
+          shopt -s nullglob nocaseglob
+          for a in "$GAME"/*.zip "$GAME"/*.rar "$GAME"/*.7z; do
+            echo "Extrayendo $(basename "$a")..."
+            unar -q -f -D -o "$GAME" "$a" && rm -f "$a"
+          done
+          # Paquetes dentro de subcarpetas: llevarlos a la carpeta del juego.
+          find "$GAME" -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv -n {} "$GAME"/ \;
+          find "$GAME" -mindepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
+
+          ls -la "$GAME"
+          n=$(find "$GAME" -maxdepth 1 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) | wc -l)
+          [ "$n" -gt 0 ] || { echo "::error::No hay ningún .nsp/.xci/.nsz/.xcz tras la descarga."; exit 1; }
+          df -h /
+
+      - name: Compilar IPA
+        env:
+          LANG_IN: ${{ inputs.language }}
+          SKIP_BOOT: ${{ inputs.skip_mac_boot }}
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          args=("$RUNNER_TEMP/game" -k "$RUNNER_TEMP/keys/prod.keys"
+                --work-dir "$RUNNER_TEMP/build" -o "$RUNNER_TEMP/out/NxNative.ipa"
+                --no-keep-extracted --progress lines)
+          [ -n "${LANG_IN:-}" ] && args+=(-l "$LANG_IN")
+          [ "${SKIP_BOOT:-false}" = "true" ] && args+=(--no-heap-check)
+          python scripts/build_ipa_from_nsp.py "${args[@]}"
+          ls -lh "$RUNNER_TEMP/out"
+          df -h /
+
+      - name: Subir IPA (dura 1 día; bórralo al descargarlo)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ipa-${{ github.run_number }}
+          path: ${{ runner.temp }}/out/*.ipa
+          if-no-files-found: error
+          compression-level: 0   # un IPA ya es un zip
+          retention-days: 1
+
+      - name: Subir logs si falla
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/build/logs/
+            ${{ runner.temp }}/game/*_survey/
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Borrar juego y claves del runner
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/game" "$RUNNER_TEMP/keys" "$RUNNER_TEMP/build"
